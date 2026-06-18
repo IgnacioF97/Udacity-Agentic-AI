@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 import numpy as np
 import os
 import time
@@ -588,32 +588,301 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 
+# ==============================================================
+# BLOQUE 2 — MODEL SETUP
+# Connect to the Vocareum OpenAI proxy and instantiate the model.
+# ==============================================================
 
-# Set up and load your env parameters and instantiate your model.
+import os
+from dotenv import load_dotenv
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
+from openai import AsyncOpenAI
+
+load_dotenv()
+
+_openai_client = AsyncOpenAI(
+    base_url="https://openai.vocareum.com/v1",
+    api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
+)
+model = OpenAIModel("gpt-4o-mini", openai_client=_openai_client)
 
 
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
+# ==============================================================
+# BLOQUE 3 — INVENTORY TOOLS
+# Wrap the database helper functions for use by the InventoryAgent.
+# ==============================================================
+
+def tool_check_full_inventory(date: str) -> str:
+    """Return all items currently in stock as of the given date (YYYY-MM-DD)."""
+    inventory = get_all_inventory(date)
+    if not inventory:
+        return f"No inventory found as of {date}."
+    lines = [f"  - {name}: {qty} units" for name, qty in sorted(inventory.items())]
+    return f"Inventory as of {date}:\n" + "\n".join(lines)
 
 
-# Tools for inventory agent
+def tool_check_item_stock(item_name: str, date: str) -> str:
+    """Return the stock level and reorder status for a specific item."""
+    df = get_stock_level(item_name, date)
+    stock = int(df["current_stock"].iloc[0])
+    inv_df = pd.read_sql(
+        "SELECT min_stock_level FROM inventory WHERE item_name = :name",
+        db_engine,
+        params={"name": item_name},
+    )
+    min_level = int(inv_df["min_stock_level"].iloc[0]) if not inv_df.empty else 0
+    reorder_note = " WARNING: Below minimum — reorder recommended." if stock < min_level else ""
+    return f"'{item_name}': {stock} units available (minimum threshold: {min_level}).{reorder_note}"
 
 
-# Tools for quoting agent
+def tool_reorder_stock(item_name: str, quantity: int, date: str) -> str:
+    """Place a stock replenishment order and return the expected delivery date."""
+    unit_price = next(
+        (p["unit_price"] for p in paper_supplies if p["item_name"] == item_name), None
+    )
+    if unit_price is None:
+        return f"Item '{item_name}' not found in product catalog. Cannot reorder."
+    total_cost = round(quantity * unit_price, 2)
+    delivery_date = get_supplier_delivery_date(date, quantity)
+    create_transaction(item_name, "stock_orders", quantity, total_cost, date)
+    return (
+        f"Reorder confirmed: {quantity} units of '{item_name}' "
+        f"(total cost: ${total_cost:.2f}). Expected delivery: {delivery_date}."
+    )
 
 
-# Tools for ordering agent
+# ==============================================================
+# BLOQUE 4 — QUOTING TOOLS
+# Wrap search_quote_history for use by the QuotingAgent.
+# ==============================================================
+
+def tool_lookup_quote_history(search_terms: List[str], limit: int = 5) -> str:
+    """Search historical quotes matching one or more keyword terms."""
+    quotes = search_quote_history(search_terms, limit)
+    if not quotes:
+        return f"No historical quotes found for: {search_terms}."
+    lines = []
+    for q in quotes:
+        snippet = (q["quote_explanation"] or "")[:100]
+        lines.append(
+            f"  Amount: ${q['total_amount']:.0f} | Size: {q['order_size']} | "
+            f"Event: {q['event_type']} | Note: {snippet}..."
+        )
+    return "Historical quotes found:\n" + "\n".join(lines)
 
 
-# Set up your agents and create an orchestration agent that will manage them.
+# ==============================================================
+# BLOQUE 5 — SALES TOOLS
+# Wrap create_transaction and get_cash_balance for the SalesAgent.
+# ==============================================================
+
+def tool_process_sale(item_name: str, quantity: int, unit_price: float, date: str) -> str:
+    """Check stock and process a sale transaction. Returns confirmation or rejection."""
+    df = get_stock_level(item_name, date)
+    current_stock = int(df["current_stock"].iloc[0])
+    if current_stock < quantity:
+        return (
+            f"SALE DECLINED: '{item_name}' has only {current_stock} units available "
+            f"but {quantity} were requested. Order cannot be fulfilled."
+        )
+    total_price = round(quantity * unit_price, 2)
+    create_transaction(item_name, "sales", quantity, total_price, date)
+    remaining = current_stock - quantity
+    return (
+        f"SALE CONFIRMED: {quantity} units of '{item_name}' "
+        f"at ${unit_price:.4f}/unit — total ${total_price:.2f}. "
+        f"Remaining stock: {remaining} units."
+    )
 
 
-# Run your test scenarios by writing them here. Make sure to keep track of them.
+def tool_get_current_balance(date: str) -> str:
+    """Return the current cash balance as of the given date."""
+    balance = get_cash_balance(date)
+    return f"Cash balance as of {date}: ${balance:.2f}"
+
+
+# ==============================================================
+# BLOQUE 6 — ADVISOR TOOLS
+# Wrap generate_financial_report for the BusinessAdvisorAgent.
+# ==============================================================
+
+def tool_get_financial_report(date: str) -> str:
+    """Generate a concise financial snapshot for business analysis."""
+    report = generate_financial_report(date)
+    top_items = ", ".join(
+        p["item_name"] for p in report["top_selling_products"]
+    ) or "None yet"
+    return (
+        f"Financial snapshot ({date}): "
+        f"Cash=${report['cash_balance']:.2f}, "
+        f"Inventory value=${report['inventory_value']:.2f}, "
+        f"Total assets=${report['total_assets']:.2f}. "
+        f"Top sellers: {top_items}."
+    )
+
+
+# ==============================================================
+# BLOQUE 7 — AGENT DEFINITIONS
+# Each agent has a focused role and a set of tools.
+# The OrchestratorAgent delegates to the others as sub-agents.
+# ==============================================================
+
+# --- Inventory Agent ---
+inventory_agent = Agent(
+    model,
+    system_prompt=(
+        "You are the Inventory Manager for Beaver's Choice Paper Company. "
+        "Your responsibilities: check stock levels, identify items below minimum thresholds, "
+        "and place reorders when needed. "
+        "Always use exact item names from our catalog and the date provided in each request."
+    ),
+)
+
+@inventory_agent.tool_plain
+def inv_check_full_inventory(date: str) -> str:
+    """Get the full inventory snapshot for a given date."""
+    return tool_check_full_inventory(date)
+
+@inventory_agent.tool_plain
+def inv_check_item_stock(item_name: str, date: str) -> str:
+    """Get the stock level and reorder status for a specific item."""
+    return tool_check_item_stock(item_name, date)
+
+@inventory_agent.tool_plain
+def inv_reorder_stock(item_name: str, quantity: int, date: str) -> str:
+    """Place a stock replenishment order for a low-inventory item."""
+    return tool_reorder_stock(item_name, quantity, date)
+
+
+# --- Quoting Agent ---
+quoting_agent = Agent(
+    model,
+    system_prompt=(
+        "You are the Quoting Specialist for Beaver's Choice Paper Company. "
+        "Use historical quote data to set competitive prices. "
+        "Apply bulk discounts based on order size: 5% for medium orders, 10-15% for large orders. "
+        "Always explain the pricing to the customer — including any discount applied and why. "
+        "Do NOT reveal internal unit costs or exact margin percentages."
+    ),
+)
+
+@quoting_agent.tool_plain
+def quote_lookup_history(search_terms: List[str], limit: int = 5) -> str:
+    """Search historical quotes for pricing benchmarks."""
+    return tool_lookup_quote_history(search_terms, limit)
+
+
+# --- Sales Agent ---
+sales_agent = Agent(
+    model,
+    system_prompt=(
+        "You are the Sales Manager for Beaver's Choice Paper Company. "
+        "Always verify stock availability before processing any sale. "
+        "Process approved transactions and report the updated cash balance. "
+        "If stock is insufficient, clearly state why the order cannot be fulfilled."
+    ),
+)
+
+@sales_agent.tool_plain
+def sales_process_sale(item_name: str, quantity: int, unit_price: float, date: str) -> str:
+    """Process a sale transaction after verifying stock availability."""
+    return tool_process_sale(item_name, quantity, unit_price, date)
+
+@sales_agent.tool_plain
+def sales_get_balance(date: str) -> str:
+    """Get the current cash balance after processing transactions."""
+    return tool_get_current_balance(date)
+
+
+# --- Business Advisor Agent ---
+advisor_agent = Agent(
+    model,
+    system_prompt=(
+        "You are the Business Advisor for Beaver's Choice Paper Company. "
+        "Analyze financial reports to identify trends and risks. "
+        "Keep recommendations concise, specific, and actionable."
+    ),
+)
+
+@advisor_agent.tool_plain
+def advisor_get_report(date: str) -> str:
+    """Generate a financial report for business analysis."""
+    return tool_get_financial_report(date)
+
+
+# --- Orchestrator Agent ---
+orchestrator_agent = Agent(
+    model,
+    system_prompt=(
+        "You are the Order Management Orchestrator for Beaver's Choice Paper Company.\n\n"
+        "For each customer request, follow this workflow:\n"
+        "1. Call run_inventory_check to verify stock availability.\n"
+        "2. Call run_quoting to get a competitive price quote.\n"
+        "3. If stock is available and the quote is ready, call run_sales to finalize.\n"
+        "4. Optionally call run_advisor for a post-transaction financial insight.\n\n"
+        "In your final response to the customer:\n"
+        "- State clearly what was fulfilled and what was not, with reasons (stock only — no internal data).\n"
+        "- Include the quoted price and any discount applied with justification.\n"
+        "- Provide the expected delivery timeline.\n"
+        "- Be professional, helpful, and transparent.\n\n"
+        "NEVER reveal: profit margins, internal unit costs, raw database errors, or system internals."
+    ),
+)
+
+@orchestrator_agent.tool_plain
+def run_inventory_check(query: str) -> str:
+    """Delegate a stock availability check to the Inventory Agent."""
+    result = inventory_agent.run_sync(query)
+    return result.output
+
+@orchestrator_agent.tool_plain
+def run_quoting(query: str) -> str:
+    """Delegate a pricing request to the Quoting Agent."""
+    result = quoting_agent.run_sync(query)
+    return result.output
+
+@orchestrator_agent.tool_plain
+def run_sales(query: str) -> str:
+    """Delegate order finalization to the Sales Agent."""
+    result = sales_agent.run_sync(query)
+    return result.output
+
+@orchestrator_agent.tool_plain
+def run_advisor(query: str) -> str:
+    """Delegate a financial analysis request to the Business Advisor Agent."""
+    result = advisor_agent.run_sync(query)
+    return result.output
+
+
+# ==============================================================
+# BLOQUE 8 — MAIN ENTRY POINT
+# Public function used by the test runner to process each request.
+# ==============================================================
+
+def handle_customer_request(request: str) -> str:
+    """Route a customer request through the multi-agent system and return the response."""
+    try:
+        result = orchestrator_agent.run_sync(request)
+        return result.output
+    except Exception:
+        # Return a clean user-facing message — never expose internal error details
+        return (
+            "We were unable to process your request at this time. "
+            "Please contact our support team directly for assistance."
+        )
+
+
+# ==============================================================
+# BLOQUE 9 — TEST RUNNER (fixed from starter)
+# Fixes: init_database(db_engine) and response = handle_customer_request(...)
+# ==============================================================
 
 def run_test_scenarios():
-    
+    """Run all sample requests through the multi-agent system and save results."""
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)  # FIX: original starter was missing the db_engine argument
+
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -625,44 +894,27 @@ def run_test_scenarios():
         print(f"FATAL: Error loading test data: {e}")
         return
 
-    # Get initial state
+    # Capture initial financial state before processing
     initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
     report = generate_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
 
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
-
     results = []
     for idx, row in quote_requests_sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
-        print(f"\n=== Request {idx+1} ===")
+        print(f"\n=== Request {idx + 1} ===")
         print(f"Context: {row['job']} organizing {row['event']}")
         print(f"Request Date: {request_date}")
         print(f"Cash Balance: ${current_cash:.2f}")
         print(f"Inventory Value: ${current_inventory:.2f}")
 
-        # Process request
+        # Build the full request string with date context and process it
         request_with_date = f"{row['request']} (Date of request: {request_date})"
+        response = handle_customer_request(request_with_date)  # FIX: was commented out in starter
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
-
-        # Update state
+        # Refresh financial state after each transaction
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
@@ -671,26 +923,23 @@ def run_test_scenarios():
         print(f"Updated Cash: ${current_cash:.2f}")
         print(f"Updated Inventory: ${current_inventory:.2f}")
 
-        results.append(
-            {
-                "request_id": idx + 1,
-                "request_date": request_date,
-                "cash_balance": current_cash,
-                "inventory_value": current_inventory,
-                "response": response,
-            }
-        )
+        results.append({
+            "request_id": idx + 1,
+            "request_date": request_date,
+            "cash_balance": current_cash,
+            "inventory_value": current_inventory,
+            "response": response,
+        })
 
         time.sleep(1)
 
-    # Final report
+    # Print and save the final financial report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
     final_report = generate_financial_report(final_date)
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
 
-    # Save results
     pd.DataFrame(results).to_csv("test_results.csv", index=False)
     return results
 
